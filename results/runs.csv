@@ -1,0 +1,2 @@
+role,protocol,tag,window,rto,integrity_ok,bytes_delivered,transfer_time_s,goodput_mbps,packets_sent,retransmissions,retx_per_packet,acks_received,corrupted_dropped,avg_rtt_ms
+client,saw,,8,0.2,True,1000000,0.1002,79.844,977,0,0.0,977,0,0.069
