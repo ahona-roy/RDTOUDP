@@ -57,22 +57,26 @@ class GoBackNSender(BaseSender):
             if ack is not None and ack.ptype == ACK:
                 ack_num = ack.ack
 
-                if base < ack_num <= next_seq:
-                    for seq in range(base, ack_num):
+                if base <= ack_num < next_seq:
+                    for seq in range(base, ack_num + 1):
                         outstanding.pop(seq, None)
                         retries.pop(seq, None)
 
-                    base = ack_num
+                    base = ack_num + 1
 
                     if outstanding:
                         timer_start = time.monotonic()
                     else:
                         timer_start = None
 
+                    self.stats.acks_received += 1
                     continue
 
             if ack is None or remaining <= 0:
-                log.debug("Timeout: retransmitting window from seq=%d", base)
+                log.debug(
+                    "Timeout: retransmitting window from seq=%d",
+                    base
+                )
 
                 for seq in sorted(outstanding):
                     if retries[seq] >= MAX_RETRIES:
@@ -122,14 +126,15 @@ class GoBackNReceiver(BaseReceiver):
                     written += len(payload)
                     self.expected_seq += 1
 
-                self.send_packet(
-                    Packet(ACK, ack=self.expected_seq),
-                    addr
-                )
+                if self.expected_seq > 0:
+                    self.send_packet(
+                        Packet(ACK, ack=self.expected_seq - 1),
+                        addr
+                    )
 
     def handle_late_data(self, pkt, addr):
-        if pkt.ptype == DATA:
+        if pkt.ptype == DATA and self.expected_seq > 0:
             self.send_packet(
-                Packet(ACK, ack=self.expected_seq),
+                Packet(ACK, ack=self.expected_seq - 1),
                 addr
             )
