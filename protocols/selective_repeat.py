@@ -1,182 +1,126 @@
-"""Selective Repeat over UDP.
+"""Selective Repeat ARQ (Member 3).
  
-Sender: per-packet deadlines kept in a min-heap, single-threaded loop.
-Receiver: buffers out-of-order packets, ACKs each one individually
-(ACK packet with ack == seq of the data packet), writes in order.
- 
-ASSUMPTIONS about Member 1's code (adjust the few marked lines if different):
-  - common.packet exposes Packet, DATA, ACK
-  - Packet(type=, seq=, ack=, payload=b"").pack() -> bytes
-  - Packet.unpack(raw) -> Packet (with .type .seq .ack .payload) or None
-  - sequence numbers start at 0 for the first data packet
+Sender  : per-packet deadlines in a min-heap, one single-threaded loop; a timeout
+          resends only that packet. Karn's algorithm: no RTT sample from a
+          retransmitted packet.
+Receiver: ACKs every DATA packet individually (ACK.ack == data seq), buffers
+          out-of-order packets, writes in order, returns once expected_size bytes
+          have been written. handle_late_data() re-ACKs retransmissions that
+          arrive after completion (lost final ACK).
 """
- 
 import heapq
-import os
-import socket
+import logging
 import time
  
-from common.packet import Packet, DATA, ACK
-from common.config import PACKET_SIZE, MAX_RETRIES, INITIAL_RTO
+from common.config import ACK, DATA, MAX_RETRIES, RECV_IDLE_TIMEOUT
+from common.packet import Packet
+from protocols.base import BaseReceiver, BaseSender
  
-try:
-    from protocols.base import BaseSender, BaseReceiver
-except ImportError:  # base.py not merged yet
-    class BaseSender:
-        pass
- 
-    class BaseReceiver:
-        pass
- 
-try:
-    from protocols.rto import RTOEstimator
-except ImportError:
-    RTOEstimator = None
- 
-IDLE_TIMEOUT = 30.0  # receiver gives up if nothing valid arrives for this long
+log = logging.getLogger("rdt.sr")
  
  
 class SelectiveRepeatSender(BaseSender):
-    def __init__(self, sock, dest_addr, window_size, stats, rto=None):
-        self.sock = sock
-        self.dest_addr = dest_addr
-        self.window = window_size
-        self.stats = stats
-        # rto: an RTOEstimator (adaptive or fixed). Default: fixed INITIAL_RTO.
-        if rto is None:
-            if RTOEstimator is None:
-                raise RuntimeError("protocols/rto.py (RTOEstimator) is missing")
-            rto = RTOEstimator(initial_rto=INITIAL_RTO, fixed=True)
-        self.rto = rto
- 
-    def _transmit(self, entry):
-        self.sock.sendto(entry["raw"], self.dest_addr)
-        self.stats.packets_sent += 1
-        now = time.monotonic()
-        entry["sent"] = now
-        entry["deadline"] = now + self.rto.rto
-        heapq.heappush(self.heap, (entry["deadline"], entry["seq"]))
+    def _transmit(self, entry, heap):
+        self.send_packet(entry["pkt"])
+        entry["sent"] = time.monotonic()
+        entry["deadline"] = entry["sent"] + self.current_rto()
+        heapq.heappush(heap, (entry["deadline"], entry["pkt"].seq))
  
     def send_file(self, filepath):
-        total = -(-os.path.getsize(filepath) // PACKET_SIZE)  # ceil, 0 if empty
-        self.heap = []
-        inflight = {}        # seq -> entry for sent but un-ACKed packets
-        acked = set()        # ACKed seqs >= base (out-of-order ACKs)
+        chunks = self.read_chunks(filepath)
+        exhausted = False
+        inflight = {}      # seq -> entry, sent but not yet ACKed
+        acked = set()      # ACKed seqs at or above base (out-of-order ACKs)
+        heap = []          # (deadline, seq); stale items skipped lazily
         base = next_seq = 0
  
-        with open(filepath, "rb") as f:
-            while base < total:
-                # 1. fill the window
-                while next_seq < total and next_seq < base + self.window:
-                    chunk = f.read(PACKET_SIZE)
-                    raw = Packet(type=DATA, seq=next_seq, ack=0,
-                                 payload=chunk).pack()
-                    entry = {"seq": next_seq, "raw": raw, "retries": 0,
-                             "retx": False}
-                    inflight[next_seq] = entry
-                    self._transmit(entry)
-                    next_seq += 1
- 
-                # 2. handle expired deadlines (one backoff per timeout event)
-                now = time.monotonic()
-                timed_out = False
-                while self.heap and self.heap[0][0] <= now:
-                    deadline, seq = heapq.heappop(self.heap)
-                    entry = inflight.get(seq)
-                    if entry is None or entry["deadline"] != deadline:
-                        continue  # stale heap item (already ACKed/rescheduled)
-                    entry["retries"] += 1
-                    if entry["retries"] > MAX_RETRIES:
-                        raise ConnectionError(
-                            f"seq {seq}: no ACK after {MAX_RETRIES} retries")
-                    entry["retx"] = True  # Karn: no RTT sample from this one
-                    self.stats.retransmissions += 1
-                    timed_out = True
-                    self._transmit(entry)
-                if timed_out:
-                    self.rto.backoff()
- 
-                # 3. wait for an ACK until the earliest valid deadline
-                while self.heap and (self.heap[0][1] not in inflight or
-                                     inflight[self.heap[0][1]]["deadline"]
-                                     != self.heap[0][0]):
-                    heapq.heappop(self.heap)  # drop stale items
-                wait = (self.heap[0][0] - time.monotonic()) if self.heap else 0.05
-                self.sock.settimeout(max(0.001, wait))
+        while True:
+            # 1. fill the window
+            while not exhausted and next_seq < base + self.window:
                 try:
-                    raw, _ = self.sock.recvfrom(65535)
-                except socket.timeout:
-                    continue
-                pkt = Packet.unpack(raw)
-                if pkt is None or pkt.type != ACK:
-                    continue
-                self.stats.acks_received += 1
-                entry = inflight.pop(pkt.ack, None)
-                if entry is None:
-                    continue  # duplicate ACK
-                if not entry["retx"]:  # Karn's algorithm
-                    rtt = time.monotonic() - entry["sent"]
-                    self.stats.rtt_samples.append(rtt)
-                    self.rto.update(rtt)
-                acked.add(pkt.ack)
-                while base in acked:
-                    acked.discard(base)
-                    base += 1
+                    chunk = next(chunks)
+                except StopIteration:
+                    exhausted = True
+                    break
+                entry = {"pkt": Packet(DATA, seq=next_seq, payload=chunk),
+                         "retries": 0, "retx": False}
+                inflight[next_seq] = entry
+                self._transmit(entry, heap)
+                next_seq += 1
+ 
+            if exhausted and not inflight:
+                return
+ 
+            # 2. retransmit packets whose deadline has passed (only those)
+            now = time.monotonic()
+            timed_out = False
+            while heap and heap[0][0] <= now:
+                deadline, seq = heapq.heappop(heap)
+                entry = inflight.get(seq)
+                if entry is None or entry["deadline"] != deadline:
+                    continue                       # stale heap item
+                entry["retries"] += 1
+                if entry["retries"] > MAX_RETRIES:
+                    raise ConnectionError(f"seq {seq}: no ACK after {MAX_RETRIES} retries")
+                log.debug("timeout seq=%d (retry %d)", seq, entry["retries"])
+                entry["retx"] = True               # Karn: never sample this packet
+                self.stats.retransmissions += 1
+                timed_out = True
+                self._transmit(entry, heap)
+            if timed_out and self.rto_estimator:
+                self.rto_estimator.backoff()       # once per timeout event
+ 
+            # 3. wait for an ACK until the earliest live deadline
+            while heap and (heap[0][1] not in inflight or
+                            inflight[heap[0][1]]["deadline"] != heap[0][0]):
+                heapq.heappop(heap)
+            wait = heap[0][0] - time.monotonic() if heap else 0.05
+            ack, _ = self.recv_packet(max(0.001, wait))
+            if ack is None or ack.ptype != ACK:
+                continue
+            entry = inflight.pop(ack.ack, None)
+            if entry is None:
+                continue                           # duplicate / stale ACK
+            self.stats.acks_received += 1
+            if not entry["retx"]:                  # Karn's algorithm
+                rtt = time.monotonic() - entry["sent"]
+                self.stats.rtt_samples.append(rtt)
+                if self.rto_estimator:
+                    self.rto_estimator.update(rtt)
+            acked.add(ack.ack)
+            while base in acked:
+                acked.discard(base)
+                base += 1
  
  
 class SelectiveRepeatReceiver(BaseReceiver):
-    # Seconds to keep re-ACKing retransmitted data after the last byte is
-    # written. 0 = return immediately (as specified). If the sender hangs at
-    # high loss because the final ACK was lost, set to ~2 * RTO.
-    linger = 0.0
- 
-    def __init__(self, sock, stats, expected_size=None):
-        self.sock = sock
-        self.stats = stats
-        self.expected_size = expected_size  # set by the app before receive_file
- 
-    def _ack(self, seq, addr):
-        self.sock.sendto(Packet(type=ACK, seq=0, ack=seq).pack(), addr)
+    def __init__(self, sock, stats):
+        super().__init__(sock, stats)
+        self.rcv_base = 0      # next seq to write
+        self.buffer = {}       # out-of-order payloads
  
     def receive_file(self, out_path):
-        if self.expected_size is None:
-            raise ValueError("set receiver.expected_size before receive_file()")
-        rcv_base = 0
         written = 0
-        buffer = {}
-        last_valid = time.monotonic()
- 
-        with open(out_path, "wb") as out:
+        last_activity = time.monotonic()
+        with open(out_path, "wb") as f:
             while written < self.expected_size:
-                self.sock.settimeout(1.0)
-                try:
-                    raw, addr = self.sock.recvfrom(65535)
-                except socket.timeout:
-                    if time.monotonic() - last_valid > IDLE_TIMEOUT:
-                        raise TimeoutError("receiver idle: sender went silent")
+                pkt, addr = self.recv_packet(1.0)
+                if pkt is None:
+                    if time.monotonic() - last_activity > RECV_IDLE_TIMEOUT:
+                        raise TimeoutError("receiver idle too long")
                     continue
-                pkt = Packet.unpack(raw)
-                if pkt is None or pkt.type != DATA:
-                    continue  # corrupted or not data: ignore
-                last_valid = time.monotonic()
-                self._ack(pkt.seq, addr)  # ACK new AND duplicate packets
-                if pkt.seq >= rcv_base and pkt.seq not in buffer:
-                    buffer[pkt.seq] = pkt.payload
-                while rcv_base in buffer:
-                    data = buffer.pop(rcv_base)
-                    out.write(data)
+                last_activity = time.monotonic()
+                if pkt.ptype != DATA:
+                    continue
+                self.send_packet(Packet(ACK, ack=pkt.seq), addr)   # new or duplicate
+                if pkt.seq >= self.rcv_base and pkt.seq not in self.buffer:
+                    self.buffer[pkt.seq] = pkt.payload
+                while self.rcv_base in self.buffer:
+                    data = self.buffer.pop(self.rcv_base)
+                    f.write(data)
                     written += len(data)
-                    rcv_base += 1
+                    self.rcv_base += 1
  
-            # optional: keep re-ACKing so a lost final ACK doesn't stall sender
-            end = time.monotonic() + self.linger
-            while time.monotonic() < end:
-                self.sock.settimeout(max(0.001, end - time.monotonic()))
-                try:
-                    raw, addr = self.sock.recvfrom(65535)
-                except socket.timeout:
-                    break
-                pkt = Packet.unpack(raw)
-                if pkt is not None and pkt.type == DATA:
-                    self._ack(pkt.seq, addr)
- 
+    def handle_late_data(self, pkt, addr):
+        if pkt.seq < self.rcv_base:
+            self.send_packet(Packet(ACK, ack=pkt.seq), addr)
